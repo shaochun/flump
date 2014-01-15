@@ -3,6 +3,10 @@
 
 package flump.display {
 
+import flash.geom.Matrix;
+import flash.geom.Point;
+import flash.geom.Rectangle;
+
 import flump.mold.MovieMold;
 
 import react.Signal;
@@ -11,6 +15,7 @@ import starling.animation.IAnimatable;
 import starling.display.DisplayObject;
 import starling.display.Sprite;
 import starling.events.Event;
+import starling.utils.MatrixUtil;
 
 /**
  * A movie created from flump-exported data. It has children corresponding to the layers in the
@@ -71,7 +76,7 @@ public class Movie extends Sprite
     public function get numFrames () :int { return _numFrames; }
 
     /** @return true if the movie is currently playing. */
-    public function get isPlaying () :Boolean { return _playing; }
+    public function get isPlaying () :Boolean { return _state == PLAYING; }
 
     /** @return true if the movie contains the given label. */
     public function hasLabel (label :String) :Boolean {
@@ -80,7 +85,7 @@ public class Movie extends Sprite
 
     /** Plays the movie from its current frame. The movie will loop forever.  */
     public function loop () :Movie {
-        _playing = true;
+        _state = PLAYING;
         _stopFrame = NO_FRAME;
         return this;
     }
@@ -119,31 +124,65 @@ public class Movie extends Sprite
     * a label on this movie.
     */
     public function playTo (position :Object) :Movie {
-       _stopFrame = extractFrame(position);
-       // don't play if we're already at the stop frame
-       _playing = (_frame != _stopFrame);
-       return this;
+       // won't play if we're already at the stop position
+       return stopAt(position).play();
+    }
+
+    /**
+     * Sets the stop frame for this Movie.
+     *
+     * @param position the int frame or String label to stop at.
+     *
+     * @return this movie for chaining
+     *
+     * @throws Error if position isn't an int or String, or if it is a String and that String isn't
+     * a label on this movie.
+     */
+    public function stopAt (position :Object) :Movie {
+        _stopFrame = extractFrame(position);
+        return this;
+    }
+
+    /**
+     * Sets the movie playing. It will automatically stop at its stopFrame, if one is set,
+     * otherwise it will loop forever.
+     *
+     * @return this movie for chaining
+     */
+    public function play () :Movie {
+        // set playing to true unless movie is at the stop frame
+        _state = (_frame != _stopFrame ? PLAYING : STOPPED);
+        return this;
     }
 
     /** Stops playback if it's currently active. Doesn't alter the current frame or stop frame. */
     public function stop () :Movie {
-        _playing = false;
+        _state = STOPPED;
+        return this;
+    }
+
+    /** Stops playback of this movie, but not its children */
+    public function playChildrenOnly () :Movie {
+        _state = PLAYING_CHILDREN_ONLY;
         return this;
     }
 
     /** Advances the playhead by the give number of seconds. From IAnimatable. */
     public function advanceTime (dt :Number) :void {
         if (dt < 0) throw new Error("Invalid time [dt=" + dt + "]");
-        if (!_playing) return;
+        if (_skipAdvanceTime) { _skipAdvanceTime = false; return; }
+        if (_state == STOPPED) return;
 
-        if (_numFrames > 1) {
+        if (_state == PLAYING && _numFrames > 1) {
             _playTime += dt;
             var actualPlaytime :Number = _playTime;
             if (_playTime >= _duration) _playTime %= _duration;
 
             // If _playTime is very close to _duration, rounding error can cause us to
             // land on lastFrame + 1. Protect against that.
-            var newFrame :int = clamp(int(_playTime * _frameRate), 0, _numFrames - 1);
+            var newFrame :int = int(_playTime * _frameRate);
+            if (newFrame < 0) newFrame = 0;
+            if (newFrame >= _numFrames) newFrame = _numFrames - 1;
 
             // If the update crosses or goes to the stopFrame:
             // go to the stopFrame, stop the movie, clear the stopFrame
@@ -153,20 +192,53 @@ public class Movie extends Sprite
                     (_frame <= _stopFrame ? _stopFrame - _frame : _numFrames - _frame + _stopFrame);
                 var framesElapsed :int = int(actualPlaytime * _frameRate) - _frame;
                 if (framesElapsed >= framesRemaining) {
-                    _playing = false;
+                    _state = STOPPED;
                     newFrame = _stopFrame;
-                    _stopFrame = NO_FRAME;
                 }
             }
             updateFrame(newFrame, dt);
         }
 
-        for (var ii :int = this.numChildren - 1; ii >= 0; --ii) {
-            var child :DisplayObject = getChildAt(ii);
-            if (child is Movie) {
-                Movie(child).advanceTime(dt);
-            }
+        for each (var layer :Layer in _layers) {
+            layer.advanceTime(dt);
         }
+    }
+
+    /**
+     * @public
+     *
+     * Modified from starling.display.DisplayObjectContainer
+     */
+    public override function getBounds (targetSpace :DisplayObject, resultRect :Rectangle=null) :Rectangle {
+        if (resultRect == null) {
+            resultRect = new Rectangle();
+        } else {
+            resultRect.setEmpty();
+        }
+
+        // get bounds from layer contents
+        for each (var layer :Layer in _layers) {
+            layer.expandBounds(targetSpace, resultRect);
+        }
+
+        // if no contents exist, simply include this movie's position in the bounds
+        if (resultRect.isEmpty()) {
+            getTransformationMatrix(targetSpace, IDENTITY_MATRIX);
+            MatrixUtil.transformCoords(IDENTITY_MATRIX, 0.0, 0.0, _s_helperPoint);
+            resultRect.setTo(_s_helperPoint.x, _s_helperPoint.y, 0, 0);
+        }
+
+        return resultRect;
+    }
+
+    /**
+     * @private
+     *
+     * Called when the Movie has been newly added to a layer.
+     */
+    internal function addedToLayer () :void {
+        goTo(0);
+        _skipAdvanceTime = true;
     }
 
     /** @private */
@@ -219,8 +291,7 @@ public class Movie extends Sprite
         if (newFrame != _frame) {
             if (wrapped) {
                 for each (var layer :Layer in _layers) {
-                    layer.changedKeyframe = true;
-                    layer.keyframeIdx = 0;
+                    layer.movieLooped();
                 }
             }
             for each (layer in _layers) layer.drawFrame(newFrame);
@@ -272,10 +343,6 @@ public class Movie extends Sprite
         }
     }
 
-    protected static function clamp (n :Number, min :Number, max :Number) :Number {
-        return Math.min(Math.max(n, min), max);
-    }
-
     /** @private */
     protected var _isUpdatingFrame :Boolean;
     /** @private */
@@ -283,7 +350,7 @@ public class Movie extends Sprite
     /** @private */
     protected var _frame :int = NO_FRAME, _stopFrame :int = NO_FRAME;
     /** @private */
-    protected var _playing :Boolean = true;
+    protected var _state :int = PLAYING;
     /** @private */
     protected var _playTime :Number, _duration :Number;
     /** @private */
@@ -295,9 +362,19 @@ public class Movie extends Sprite
     /** @private */
     protected var _labels :Vector.<Vector.<String>>;
     /** @private */
+    private var _skipAdvanceTime :Boolean = false;
+    /** @private */
     internal var _playerData :MoviePlayerNode;
+    /** @private */
+    private static var _s_helperPoint :Point = new Point();
+
+    private static const IDENTITY_MATRIX :Matrix = new Matrix();
 
     private static const NO_FRAME :int = -1;
+
+    private static const STOPPED :int = 0;
+    private static const PLAYING_CHILDREN_ONLY :int = 1;
+    private static const PLAYING :int = 2;
 }
 }
 

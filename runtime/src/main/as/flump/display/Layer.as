@@ -1,8 +1,14 @@
+//
+// Flump - Copyright 2013 Flump Authors
+
 package flump.display {
+
+import flash.geom.Rectangle;
 
 import flump.mold.KeyframeMold;
 import flump.mold.LayerMold;
 
+import starling.animation.IAnimatable;
 import starling.display.DisplayObject;
 import starling.display.Sprite;
 
@@ -11,61 +17,102 @@ import starling.display.Sprite;
  * Movie. Responsible for efficiently managing the creation and display of the DisplayObjects for
  * this layer on each frame.
  */
-internal class Layer {
-    public var keyframeIdx :int;// The index of the last keyframe drawn in drawFrame
-    public var layerIdx :int;// This layer's index in the movie
-    public var keyframes :Vector.<KeyframeMold>;
-    // Only created if there are multiple items on this layer. If it does exist, the appropriate
-    // display is swapped in at keyframe changes. If it doesn't, the display is only added to the
-    // parent on layer creation
-    public var displays :Vector.<DisplayObject>;// <SPDisplayObject*>
-    public var movie :Movie; // The movie this layer belongs to
-    // If the keyframe has changed since the last drawFrame
-    public var changedKeyframe :Boolean;
-
+internal class Layer
+    implements IAnimatable
+{
     public function Layer (movie :Movie, src :LayerMold, library :Library, flipbook :Boolean) {
-        keyframes = src.keyframes;
-        this.movie = movie;
+        _keyframes = src.keyframes;
+        _movie = movie;
+        _name = src.name;
+
+        const lastKf :KeyframeMold = _keyframes[_keyframes.length - 1];
+        _numFrames = lastKf.index + lastKf.duration;
+
         var lastItem :String;
-        for (var ii :int = 0; ii < keyframes.length && lastItem == null; ii++) {
-            lastItem = keyframes[ii].ref;
+        for (var ii :int = 0; ii < _keyframes.length && lastItem == null; ii++) {
+            lastItem = _keyframes[ii].ref;
         }
-        if (!flipbook && lastItem == null) movie.addChild(new Sprite());// Label only layer
-        else {
-            var multipleItems :Boolean = flipbook;
-            for (ii = 0; ii < keyframes.length && !multipleItems; ii++) {
-                multipleItems = keyframes[ii].ref != lastItem;
-            }
-            if (!multipleItems) movie.addChild(library.createDisplayObject(lastItem));
-            else {
-                displays = new <DisplayObject>[];
-                for each (var kf :KeyframeMold in keyframes) {
-                    var display :DisplayObject =
-                        (kf.ref == null ? new Sprite() : library.createDisplayObject(kf.ref));
-                    displays.push(display);
-                    display.name = src.name;
+        if (!flipbook && lastItem == null) {
+            // The layer is empty.
+            _currentDisplay = new Sprite();
+            _movie.addChild(_currentDisplay);
+        } else {
+            // Create the display objects for each keyframe.
+            // If multiple consecutive keyframes refer to the same library item,
+            // we reuse that item across those frames.
+            _displays = new Vector.<DisplayObject>(_keyframes.length, true);
+            for (ii = 0; ii < _keyframes.length; ++ii) {
+                var kf :KeyframeMold = _keyframes[ii];
+                var display :DisplayObject = null;
+                if (ii > 0 && _keyframes[ii - 1].ref == kf.ref) {
+                    display = _displays[ii - 1];
+                } else if (kf.ref == null) {
+                    display = new Sprite();
+                } else {
+                    display = library.createDisplayObject(kf.ref);
                 }
-                movie.addChild(displays[0]);
+                _displays[ii] = display;
+                display.visible = false;
+                _movie.addChild(display);
             }
+            _currentDisplay = _displays[0];
+            _currentDisplay.visible = true;
         }
-        layerIdx = movie.numChildren - 1;
-        movie.getChildAt(layerIdx).name = src.name;
+
+        _currentDisplay.name = _name;
+    }
+
+    /** Called by Movie when we loop. */
+    public function movieLooped () :void {
+        _needsKeyframeUpdate = true;
+        _keyframeIdx = 0;
+    }
+
+    /** Advances the playhead by the give number of seconds. From IAnimatable. */
+    public function advanceTime (dt :Number) :void {
+        if (_currentDisplay is IAnimatable) {
+            IAnimatable(_currentDisplay).advanceTime(dt);
+        }
     }
 
     public function drawFrame (frame :int) :void {
-        while (keyframeIdx < keyframes.length - 1 && keyframes[keyframeIdx + 1].index <= frame) {
-            keyframeIdx++;
-            changedKeyframe = true;
+        if (_displays == null) {
+            // We have nothing to display.
+            return;
+
+        } else if (frame >= _numFrames) {
+            // We've overshot our final frame. Hide the display
+            _currentDisplay.visible = false;
+            // keep our keyframeIdx updated
+            _keyframeIdx = _keyframes.length - 1;
+            _needsKeyframeUpdate = true;
+            return;
         }
-        // We've got multiple items. Swap in the one for this kf
-        if (changedKeyframe && displays != null) {
-            movie.removeChildAt(layerIdx);
-            movie.addChildAt(displays[keyframeIdx], layerIdx);
+
+        while (_keyframeIdx < _keyframes.length - 1 && _keyframes[_keyframeIdx + 1].index <= frame) {
+            _keyframeIdx++;
+            _needsKeyframeUpdate = true;
         }
-        changedKeyframe = false;
-        const kf :KeyframeMold = keyframes[keyframeIdx];
-        const layer :DisplayObject = movie.getChildAt(layerIdx);
-        if (keyframeIdx == keyframes.length - 1 || kf.index == frame || !kf.tweened) {
+
+        if (_needsKeyframeUpdate) {
+            // Swap in the proper DisplayObject for this keyframe.
+            const disp :DisplayObject = _displays[_keyframeIdx];
+            if (_currentDisplay != disp) {
+                _currentDisplay.name = null;
+                _currentDisplay.visible = false;
+                // If we're swapping in a Movie, reset its timeline.
+                if (disp is Movie) {
+                    Movie(disp).addedToLayer();
+                }
+                _currentDisplay = disp;
+                _currentDisplay.name = _name;
+            }
+        }
+        _needsKeyframeUpdate = false;
+
+        const kf :KeyframeMold = _keyframes[_keyframeIdx];
+        const layer :DisplayObject = _currentDisplay;
+        if (_keyframeIdx == _keyframes.length - 1 || kf.index == frame || !kf.tweened) {
             layer.x = kf.x;
             layer.y = kf.y;
             layer.scaleX = kf.scaleX;
@@ -89,7 +136,7 @@ internal class Layer {
                 }
                 interped = ease * t + (1 - ease) * interped;
             }
-            const nextKf :KeyframeMold = keyframes[keyframeIdx + 1];
+            const nextKf :KeyframeMold = _keyframes[_keyframeIdx + 1];
             layer.x = kf.x + (nextKf.x - kf.x) * interped;
             layer.y = kf.y + (nextKf.y - kf.y) * interped;
             layer.scaleX = kf.scaleX + (nextKf.scaleX - kf.scaleX) * interped;
@@ -102,5 +149,42 @@ internal class Layer {
         layer.pivotY = kf.pivotY;
         layer.visible = kf.visible;
     }
+
+    /** Expands the given bounds to include the bounds of this Layer's current display object. */
+    internal function expandBounds (targetSpace :DisplayObject, resultRect :Rectangle) :Rectangle {
+        // if no objects on this frame, do not change bounds
+        if (_keyframes[_keyframeIdx].ref == null) {
+            return resultRect;
+        }
+
+        // if no rect was incoming, the resulting bounds is exactly the bounds of the display
+        if (resultRect.isEmpty()) {
+            return _currentDisplay.getBounds(targetSpace, resultRect);
+        }
+
+        // otherwise expand bounds by current display's bounds, if it has any
+        var layerRect :Rectangle = _currentDisplay.getBounds(targetSpace);
+        if (layerRect.left < resultRect.left) resultRect.left = layerRect.left;
+        if (layerRect.right > resultRect.right) resultRect.right = layerRect.right;
+        if (layerRect.top < resultRect.top) resultRect.top = layerRect.top;
+        if (layerRect.bottom > resultRect.bottom) resultRect.bottom = layerRect.bottom;
+
+        return resultRect;
+    }
+
+    protected var _keyframes :Vector.<KeyframeMold>;
+    protected var _numFrames :int;
+    // Stores this layer's DisplayObjects indexed by keyframe.
+    protected var _displays :Vector.<DisplayObject>;
+    // The current DisplayObject being rendered for this layer
+    protected var _currentDisplay :DisplayObject;
+    protected var _movie :Movie; // The movie this layer belongs to
+    // The index of the last keyframe drawn in drawFrame. Updated in drawFrame. When the parent
+    // movie loops, it resets all of its layers' keyframeIdx's to 0.
+    protected var _keyframeIdx :int;
+    // true if the keyframe has changed since the last drawFrame
+    protected var _needsKeyframeUpdate :Boolean;
+    // name of the layer
+    protected var _name :String;
 }
 }
