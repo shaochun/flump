@@ -1,8 +1,8 @@
-# Examples
+# Intro
 
-Bundle with flash example files for ui creation.
+In this branch some flash example files are created for ui demonstration.
 
-# [Customized] Creating a movie for Flump (using the examples)
+# Steps
 
 1. [Install the latest version of Adobe AIR](http://get.adobe.com/air/).
 1. [Install the Flump AIR app](https://bitbucket.org/tconkling/flump-binaries/downloads/flump-exporter.air).
